@@ -21,9 +21,6 @@ build/
 [Bb]in/
 [Oo]bj/
 
-# Local release packages
-/artifacts/
-
 # Enable "build/" folder in the NuGet Packages folder since NuGet packages use it for MSBuild targets
 !packages/*/build/
 
