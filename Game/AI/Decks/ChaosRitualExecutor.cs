@@ -942,12 +942,6 @@ namespace WindBot.Game.AI.Decks
 
             if (IsDescription(CardId.CelticMystic, 1))
             {
-                Logger.DebugWriteLine("[ChaosRitual][priority] Celtic ritual effect candidate: " +
-                    "desc=" + ActivateDescription + ", ladrGrave=" +
-                    Bot.Graveyard.Any(c => c != null && c.IsCode(
-                        CardId.LightAndDarknessRitual)) + ", ladrIdleCandidate=" +
-                    (Duel.MainPhase != null && Duel.MainPhase.ActivableCards.Any(c =>
-                        c != null && c.IsCode(CardId.LightAndDarknessRitual))));
                 return Bot.Hand.Any(IsRitualMonster);
             }
 
@@ -1023,9 +1017,6 @@ namespace WindBot.Game.AI.Decks
 
             if (Card.Location == CardLocation.Grave)
             {
-                Logger.DebugWriteLine("[ChaosRitual][priority] LightAndDarknessRitual grave " +
-                    "candidate accepted: desc=" + ActivateDescription + ", chain=" +
-                    Duel.CurrentChain.Count);
                 // The server only includes this card when the Graveyard
                 // recovery effect has a legal resolution. Do not rebuild its
                 // return-card filter from the partial client-side Graveyard
