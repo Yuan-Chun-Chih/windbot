@@ -68,6 +68,16 @@ namespace WindBot.Game.AI.Decks
             new HashSet<ClientCard>();
         private bool _enemyMaxxCResolved;
         private int _ritualSummonCountThisTurn;
+        // Optional trigger prompts can arrive with a generic description. Keep
+        // the successful normal-summon window separate from Celtic Mystic's
+        // later ignition effect so the two effects cannot borrow each other's
+        // strategic conditions.
+        private bool _celticMysticDrawTriggerPending;
+        // SelectUnselect asks for one material at a time. Once the current
+        // selection is finishable, returning an empty selection confirms it;
+        // without this state the executor can keep adding Graveyard monsters
+        // after Kuriboh Guardian has already fulfilled the entire requirement.
+        private bool _selectingLightAndDarknessRitualMaterials;
         // Light and Darkness Ritual's Graveyard effect selects its second
         // return card while the card is still in the Graveyard. Keep that
         // selection reserved until the chain ends so Skull Archfiend cannot
@@ -269,6 +279,8 @@ namespace WindBot.Game.AI.Decks
             _performedRitualSummonThisTurn = false;
             _enemyMaxxCResolved = false;
             _ritualSummonCountThisTurn = 0;
+            _celticMysticDrawTriggerPending = false;
+            _selectingLightAndDarknessRitualMaterials = false;
             _pendingReleaseCards.Clear();
             _pendingLightAndDarknessReturnCards.Clear();
             _reservedOpponentTargets.Clear();
@@ -282,8 +294,75 @@ namespace WindBot.Game.AI.Decks
             base.OnNewTurn();
         }
 
+        public override ClientCard OnSelectAttacker(IList<ClientCard> attackers, IList<ClientCard> defenders)
+        {
+            ClientCard blackLusterSoldier = attackers.FirstOrDefault(c =>
+                c != null && c.IsCode(CardId.BlackLusterSoldierSoldierOfLightAndDarkness));
+            if (blackLusterSoldier != null)
+                return blackLusterSoldier;
+
+            return base.OnSelectAttacker(attackers, defenders);
+        }
+
+        public override BattlePhaseAction OnBattle(IList<ClientCard> attackers, IList<ClientCard> defenders)
+        {
+            // GameAI normally attacks with the lowest-power monster first when
+            // the opponent has no monsters. Keep the Light and Darkness Soldier
+            // as the first attacker for direct attacks as well.
+            if (defenders.Count == 0)
+            {
+                ClientCard blackLusterSoldier = attackers.FirstOrDefault(c =>
+                    c != null && c.IsCode(CardId.BlackLusterSoldierSoldierOfLightAndDarkness));
+                if (blackLusterSoldier != null && blackLusterSoldier.CanDirectAttack)
+                    return AI.Attack(blackLusterSoldier, null);
+            }
+
+            return base.OnBattle(attackers, defenders);
+        }
+
+        public override BattlePhaseAction OnSelectAttackTarget(ClientCard attacker,
+            IList<ClientCard> defenders)
+        {
+            if (attacker != null &&
+                attacker.IsCode(CardId.BlackLusterSoldierSoldierOfLightAndDarkness))
+            {
+                foreach (ClientCard defender in defenders)
+                {
+                    attacker.RealPower = attacker.GetAttackPower();
+                    defender.RealPower = defender.GetDefensePower();
+                    if (!OnPreBattleBetween(attacker, defender))
+                        continue;
+
+                    // The Soldier is allowed to attack an attack-position
+                    // monster with equal ATK. Strictly stronger attacks keep
+                    // the normal behaviour for face-down/defence-position cards.
+                    if (attacker.RealPower > defender.RealPower ||
+                        attacker.RealPower == defender.RealPower && defender.IsAttack())
+                    {
+                        return AI.Attack(attacker, defender);
+                    }
+                }
+
+                if (attacker.CanDirectAttack)
+                    return AI.Attack(attacker, null);
+                return null;
+            }
+
+            return base.OnSelectAttackTarget(attacker, defenders);
+        }
+
         public override void OnChaining(int player, ClientCard card)
         {
+            if (player == 0 && card != null && card.IsCode(CardId.CelticMystic) &&
+                _celticMysticDrawTriggerPending)
+            {
+                // The summon-success effect has now actually been activated.
+                // Track it immediately even if the protocol used description
+                // -1, then release the pending trigger context.
+                _activatedFirstEffectCardIdsThisTurn.Add(card.Id);
+                _celticMysticDrawTriggerPending = false;
+            }
+
             if (player == 0 && card != null && card.Id != 0 &&
                 !IsMultiEffectCard(card))
             {
@@ -325,6 +404,8 @@ namespace WindBot.Game.AI.Decks
 
         public override void OnChainEnd()
         {
+            _celticMysticDrawTriggerPending = false;
+            _selectingLightAndDarknessRitualMaterials = false;
             _reservedOpponentTargets.Clear();
             _pendingDeckSearchIds.Clear();
             _pendingLightAndDarknessReturnCards.Clear();
@@ -373,8 +454,31 @@ namespace WindBot.Game.AI.Decks
                 _pendingMindShuffleReturnCards.Remove(card);
             }
 
+            if (card != null && card.IsCode(CardId.CelticMystic) &&
+                (previousLocation & (int)CardLocation.MonsterZone) != 0 &&
+                (currentLocation & (int)CardLocation.MonsterZone) == 0)
+            {
+                _celticMysticDrawTriggerPending = false;
+            }
+
             base.OnMove(card, previousControler, previousLocation, currentControler,
                 currentLocation);
+        }
+
+        public override void OnSummoning()
+        {
+            ClientCard celticMystic = Duel.SummoningCards.FirstOrDefault(c => c != null &&
+                c.Controller == 0 && c.IsCode(CardId.CelticMystic));
+            _celticMysticDrawTriggerPending = celticMystic != null &&
+                Bot.Hand.Any(c => c != null && c != celticMystic &&
+                    IsRitualRelatedCard(c));
+            base.OnSummoning();
+        }
+
+        public override void OnNewPhase()
+        {
+            _celticMysticDrawTriggerPending = false;
+            base.OnNewPhase();
         }
 
         public override void OnSpSummoned()
@@ -388,6 +492,8 @@ namespace WindBot.Game.AI.Decks
                 _performedRitualSummonThisTurn = true;
                 ++_ritualSummonCountThisTurn;
             }
+
+            _selectingLightAndDarknessRitualMaterials = false;
 
             base.OnSpSummoned();
         }
@@ -584,10 +690,21 @@ namespace WindBot.Game.AI.Decks
                     return ecclesiaTarget;
             }
 
-            if (chain != null && chain.ActivatePlayer == 0 &&
-                chain.IsActivateCode(CardId.LightAndDarknessRitual) &&
-                hint == HintMsg.Release)
+            bool selectingLightAndDarknessRitualMaterials = hint == HintMsg.Release &&
+                (_selectingLightAndDarknessRitualMaterials ||
+                 chain != null && chain.ActivatePlayer == 0 &&
+                    chain.IsActivateCode(CardId.LightAndDarknessRitual) ||
+                 cards.Any(IsGraveCard));
+            if (selectingLightAndDarknessRitualMaterials)
             {
+                _selectingLightAndDarknessRitualMaterials = true;
+
+                // In MSG_SELECT_UNSELECT_CARD, min == 0 means the materials
+                // already selected by earlier responses form a legal set.
+                // Confirm that set immediately instead of adding another card.
+                if (min == 0)
+                    return new List<ClientCard>();
+
                 // Some script/core combinations expose the ritual material
                 // request through MSG_SELECT_CARD instead of MSG_SELECT_SUM
                 // or MSG_SELECT_TRIBUTE. Keep the same Graveyard-first rule
@@ -710,28 +827,33 @@ namespace WindBot.Game.AI.Decks
 
         private bool GallantThiefSummon()
         {
-            if (!CanSummonGallantThief())
+            if (!CanSummonGallantThief(Card))
                 return false;
 
             _selectingGallantThiefTributes = true;
             return true;
         }
 
-        private bool CanSummonGallantThief()
+        private bool CanSummonGallantThief(ClientCard gallantThief)
         {
-            if (Bot.GetMonsterCount() != 0 || Enemy.GetMonsterCount() == 0)
+            if (gallantThief == null ||
+                !gallantThief.IsCode(CardId.TheWorldsGreatestGallantThief) ||
+                !Bot.Hand.Contains(gallantThief) ||
+                Bot.GetMonsterCount() != 0 || Enemy.GetMonsterCount() == 0)
                 return false;
 
             bool hasOwnFallback = Bot.Hand.Any(c => c != null && c.IsMonster() &&
-                !c.IsCode(CardId.TheWorldsGreatestGallantThief));
+                c != gallantThief);
             return Enemy.GetMonsterCount() >= 2 || hasOwnFallback;
         }
 
         private bool ShouldWaitForGallantThief()
         {
+            ClientCard gallantThief = Bot.Hand.FirstOrDefault(c => c != null &&
+                c.IsCode(CardId.TheWorldsGreatestGallantThief));
             return Duel.Player == 0 &&
                 (Duel.Phase == DuelPhase.Draw || Duel.Phase == DuelPhase.Standby) &&
-                CanSummonGallantThief();
+                CanSummonGallantThief(gallantThief);
         }
 
         private bool MaxxCActivate()
@@ -754,21 +876,26 @@ namespace WindBot.Game.AI.Decks
             if (Card.Location != CardLocation.MonsterZone)
                 return false;
 
-            if (IsDescription(CardId.TheWorldsGreatestGallantThief, 1))
-            {
-                ClientCard chainCard = GetCurrentOpponentChainCard();
-                return chainCard != null && (chainCard.Location == CardLocation.Hand ||
-                    chainCard.Location == CardLocation.Grave ||
-                    chainCard.Location == CardLocation.Removed);
-            }
+            ClientCard chainCard = GetCurrentOpponentChainCard();
+            bool canNegateRemoteEffect = chainCard != null &&
+                (chainCard.Location == CardLocation.Hand ||
+                 chainCard.Location == CardLocation.Grave ||
+                 chainCard.Location == CardLocation.Removed);
+            bool canChangeBattlePositions = Duel.Phase >= DuelPhase.BattleStart &&
+                Duel.Phase < DuelPhase.Main2 &&
+                Enemy.GetMonsters().Any(c => c.IsAttack());
 
-            if (IsDescription(CardId.TheWorldsGreatestGallantThief, 2) ||
-                ActivateDescription == -1)
-            {
-                return Duel.Phase >= DuelPhase.BattleStart &&
-                    Duel.Phase < DuelPhase.Main2 &&
-                    Enemy.GetMonsters().Any(c => c.IsAttack());
-            }
+            if (IsDescription(CardId.TheWorldsGreatestGallantThief, 1))
+                return canNegateRemoteEffect;
+
+            if (IsDescription(CardId.TheWorldsGreatestGallantThief, 2))
+                return canChangeBattlePositions;
+
+            // A generic optional-effect description is not assigned to either
+            // branch blindly. Accept it only when the live chain or battle
+            // context independently proves that at least one effect is useful.
+            if (ActivateDescription == -1)
+                return canNegateRemoteEffect || canChangeBattlePositions;
 
             return false;
         }
@@ -863,7 +990,9 @@ namespace WindBot.Game.AI.Decks
         {
             return !ShouldWaitForGallantThief() &&
                 !DefaultCheckWhetherCardIsNegated(Card) &&
-                (Bot.Hand.Any(IsRitualRelatedCard) || Bot.Hand.Any(IsRitualMonster));
+                (Bot.Hand.Any(c => c != null && c != Card &&
+                     IsRitualRelatedCard(c)) ||
+                 Bot.Hand.Any(IsRitualMonster));
         }
 
         private bool BlackLusterSoldierActivate()
@@ -872,21 +1001,34 @@ namespace WindBot.Game.AI.Decks
                 DefaultCheckWhetherCardIsNegated(Card))
                 return false;
 
-            return HasFreshOpponentTarget(Enemy.GetMonsters().Concat(Enemy.GetSpells()));
+            // Offset 0 is the summon-success facedown banish and needs an
+            // opponent field card. Offset 1 is the post-battle ATK/extra-attack
+            // effect and must not be rejected merely because no field target
+            // remains after the destroyed monster has left the field.
+            if (IsDescription(CardId.BlackLusterSoldierSoldierOfLightAndDarkness, 0))
+            {
+                return HasFreshOpponentTarget(
+                    Enemy.GetMonsters().Concat(Enemy.GetSpells()));
+            }
+
+            if (IsDescription(CardId.BlackLusterSoldierSoldierOfLightAndDarkness, 1))
+                return true;
+
+            if (ActivateDescription == -1)
+            {
+                if (Duel.Phase >= DuelPhase.BattleStart && Duel.Phase < DuelPhase.Main2)
+                    return true;
+                return HasFreshOpponentTarget(
+                    Enemy.GetMonsters().Concat(Enemy.GetSpells()));
+            }
+
+            return false;
         }
 
         private bool CanActivateCelticMystic()
         {
             if (ShouldWaitForGallantThief() || Card.Location != CardLocation.MonsterZone ||
                 DefaultCheckWhetherCardIsNegated(Card))
-                return false;
-
-            // GameAI checks Activate before SpSummon. If Black Chaos is
-            // already a legal special-summon candidate, defer Celtic Mystic's
-            // field effect so the special summon is performed first.
-            if (Duel.CurrentChain.Count == 0 &&
-                Duel.MainPhase.SpecialSummonableCards.Any(c => c != null &&
-                    c.IsCode(CardId.BlackChaos)))
                 return false;
 
             return true;
@@ -905,18 +1047,26 @@ namespace WindBot.Game.AI.Decks
             if (IsDescription(CardId.CelticMystic, 1))
                 return false;
 
-            // Some server/core versions expose both optional field effects
-            // with a generic description. Keep the draw effect as the first
-            // fallback because this executor is registered before the
-            // dedicated Ritual Special Summon executor. If the hand does not
-            // contain a Ritual-related card, this returns false and the later
-            // executor can still consider effect ②.
-            return ActivateDescription == -1 && Bot.Hand.Any(IsRitualRelatedCard);
+            // A generic description is accepted here only while the successful
+            // normal-summon trigger is still pending. It must not make the
+            // later ignition effect inherit the draw-three condition.
+            return ActivateDescription == -1 &&
+                _celticMysticDrawTriggerPending &&
+                Bot.Hand.Any(IsRitualRelatedCard);
         }
 
         private bool CelticMysticRitualSpecialSummonActivate()
         {
             if (!CanActivateCelticMystic())
+                return false;
+
+            // The draw-three effect above is a summon-success trigger and must
+            // not be delayed by a stale SpecialSummonableCards snapshot. Only
+            // the separate Ritual special-summon effect keeps this strategic
+            // priority behind an already legal Black Chaos summon.
+            if (Duel.CurrentChain.Count == 0 &&
+                Duel.MainPhase.SpecialSummonableCards.Any(c => c != null &&
+                    c.IsCode(CardId.BlackChaos)))
                 return false;
 
             // Keep Celtic Mystic's Ritual special summon behind a legal
@@ -945,26 +1095,30 @@ namespace WindBot.Game.AI.Decks
                 return Bot.Hand.Any(IsRitualMonster);
             }
 
-            // Some server/core versions expose the Ritual Monster effect with
-            // a generic description. Keep that fallback here, after the
-            // Light and Darkness Ritual executors, rather than in the earlier
-            // draw-three executor.
-            return ActivateDescription == -1 && Bot.Hand.Any(IsRitualMonster);
+            // A generic description can reach this executor only after the
+            // summon-success trigger context has ended. This prevents the two
+            // effects from accepting the same unknown-description candidate.
+            return ActivateDescription == -1 &&
+                !_celticMysticDrawTriggerPending &&
+                Bot.Hand.Any(IsRitualMonster);
         }
 
         private bool RaggedRecordsOfRitesActivate()
         {
-            if (ShouldWaitForGallantThief() || DefaultCheckWhetherCardIsNegated(Card) ||
-                !HasRitualMonsterSearchTarget())
+            if (ShouldWaitForGallantThief() || DefaultCheckWhetherCardIsNegated(Card))
                 return false;
 
             if (Card.Location == CardLocation.Grave)
             {
+                // Effect 2 only returns this card to the hand. It does not
+                // search the Deck, so the availability of a monster for effect
+                // 1 must not suppress this delayed Graveyard trigger.
                 return Bot.GetMonsters().All(c => c == null || c.HasType(CardType.Ritual));
             }
 
-            return Card.Location == CardLocation.Hand ||
-                Card.Location == CardLocation.SpellZone;
+            return HasRitualMonsterSearchTarget() &&
+                (Card.Location == CardLocation.Hand ||
+                 Card.Location == CardLocation.SpellZone);
         }
 
         private bool MindShuffleActivate()
@@ -973,10 +1127,10 @@ namespace WindBot.Game.AI.Decks
                 Card.Location != CardLocation.SpellZone)
                 return false;
 
-            if (IsDescription(CardId.MindShuffle, 1))
+            if (IsDescription(CardId.MindShuffle, 0))
                 return HasRitualMonsterSearchTarget();
 
-            if (IsDescription(CardId.MindShuffle, 2))
+            if (IsDescription(CardId.MindShuffle, 1))
                 return HasLatestOpponentChain() && CanUseMindShuffleSummon() &&
                     HasMindShuffleBreakthroughReason();
 
@@ -1306,7 +1460,8 @@ namespace WindBot.Game.AI.Decks
                 Duel.MainPhase.SummonableCards.Any(c => c != null &&
                     c.IsCode(CardId.CelticMystic) &&
                     !DefaultCheckWhetherCardIsNegated(c) &&
-                    (Bot.Hand.Any(IsRitualRelatedCard) ||
+                    (Bot.Hand.Any(handCard => handCard != null && handCard != c &&
+                         IsRitualRelatedCard(handCard)) ||
                      Bot.Hand.Any(IsRitualMonster)));
         }
 
@@ -1366,8 +1521,11 @@ namespace WindBot.Game.AI.Decks
 
             if (Card.Location == CardLocation.Grave)
             {
-                return Duel.Phase == DuelPhase.End &&
-                    Bot.Graveyard.Any(c => c.HasType(CardType.Fusion));
+                // The script records whether a Fusion Monster was sent to our
+                // Graveyard this turn. That monster does not need to remain
+                // there at the End Phase; the server candidate already proves
+                // that the event condition was met.
+                return Duel.Phase == DuelPhase.End;
             }
 
             return false;
@@ -1399,6 +1557,12 @@ namespace WindBot.Game.AI.Decks
                     ActivateDescription == -1)
                     return true;
 
+                // Do not treat an unexpected description as effect 1. Its
+                // three-card subgroup selection has strict script constraints
+                // and must only be entered for the explicit offset 0 prompt.
+                if (!IsDescription(CardId.SkullArchfiendOfChaos, 0))
+                    return false;
+
                 // Effect 1 is the explicitly described return-and-special-
                 // summon effect. Its timing and inability to chain are already
                 // enforced by the server's legal candidate list. Keep only the
@@ -1407,7 +1571,9 @@ namespace WindBot.Game.AI.Decks
                 if (IsSkullArchfiendReturnPending(Card))
                     return false;
 
-                return GetRitualRecycleCandidates().Count >= 4;
+                List<ClientCard> recycleCandidates = GetRitualRecycleCandidates();
+                return recycleCandidates.Count >= 4 &&
+                    recycleCandidates.Any(IsRitualRelatedCard);
             }
 
             return false;
@@ -1415,9 +1581,26 @@ namespace WindBot.Game.AI.Decks
 
         private bool MagicianOfDarkChaosActivate()
         {
-            return !ShouldWaitForGallantThief() && Card.Location == CardLocation.MonsterZone &&
-                !DefaultCheckWhetherCardIsNegated(Card) &&
-                Bot.Graveyard.Any(c => c.IsSpell());
+            if (ShouldWaitForGallantThief() || Card.Location != CardLocation.MonsterZone ||
+                DefaultCheckWhetherCardIsNegated(Card))
+                return false;
+
+            // The facedown-banish effect is independent of the Graveyard
+            // recovery effect. Its server-provided description is offset 1.
+            if (IsDescription(CardId.MagicianOfDarkChaosBlackChaos, 1))
+            {
+                return HasFreshOpponentTarget(
+                    Enemy.GetMonsters().Concat(Enemy.GetSpells()));
+            }
+
+            // The summon-success recovery effect is offset 0 and may also be
+            // exposed as a generic optional trigger. Any other explicit
+            // description must not inherit its Graveyard-spell condition.
+            if (IsDescription(CardId.MagicianOfDarkChaosBlackChaos, 0) ||
+                ActivateDescription == -1)
+                return Bot.Graveyard.Any(c => c.IsSpell());
+
+            return false;
         }
 
         private bool TheFallenTheVirtuousActivate()
@@ -1432,8 +1615,18 @@ namespace WindBot.Game.AI.Decks
 
         private bool SpellShatteringSwordActivate()
         {
-            if (ShouldWaitForGallantThief() || DefaultCheckWhetherCardIsNegated(Card) ||
-                Duel.CurrentChain.Count == 0)
+            if (ShouldWaitForGallantThief() || DefaultCheckWhetherCardIsNegated(Card))
+                return false;
+
+            // This is a delayed trigger from the Graveyard. The activating
+            // chain has already ended by the time the server asks for it, so
+            // it must not be rejected by the current-chain guard used by the
+            // hand/field effects.
+            if (Card.Location == CardLocation.Grave)
+                return IsDescription(CardId.SpellShatteringSword, 3) ||
+                    ActivateDescription == -1;
+
+            if (Duel.CurrentChain.Count == 0)
                 return false;
 
             ChainInfo latestOpponent = GetLatestOpponentChainInfo();
@@ -1718,6 +1911,10 @@ namespace WindBot.Game.AI.Decks
                     CardId.SpellShatteringSword, CardId.LightAndDarknessRitual);
             }
 
+            if (chain.IsActivateCode(CardId.MagicianOfDarkChaosBlackChaos) &&
+                (hint == HintMsg.Remove || hint == HintMsg.Target))
+                return SelectEffectTarget(cards, min, max, false);
+
             if (chain.IsActivateCode(CardId.BlackLusterSoldierSoldierOfLightAndDarkness) &&
                 (hint == HintMsg.Remove || hint == HintMsg.Target))
             {
@@ -1748,11 +1945,14 @@ namespace WindBot.Game.AI.Decks
                     return SelectPreferredIds(cards, min, max, CardId.LightAndDarknessRitual);
                 if (hint == HintMsg.Target || hint == HintMsg.Disable)
                     return SelectSpellShatteringSwordMonsterTarget(cards, min, max);
+                if (hint == HintMsg.Destroy)
+                    return SelectEffectTarget(cards, min, max, false);
             }
 
             if (chain.IsActivateCode(CardId.SpatialTrunade) && hint == HintMsg.ReturnToHand)
             {
-                List<ClientCard> enemyCards = cards.Where(c => c.Controller == 1)
+                List<ClientCard> enemyCards = cards.Where(c => c.Controller == 1 &&
+                        !IsOpponentTargetReserved(c))
                     .OrderByDescending(GetSpatialTrunadePriority)
                     .ThenByDescending(c => c.GetDefensePower()).ToList();
                 if (enemyCards.Count > 0)
@@ -1865,6 +2065,19 @@ namespace WindBot.Game.AI.Decks
                 .ThenBy(GetSkullArchfiendRecycleCardPriority)
                 .ThenByDescending(c => IsDuplicateInGrave(c, cards))
                 .ToList();
+
+            // The script's gcheck requires at least one of the three selected
+            // cards to have "Light and Darkness Ritual" in its card text.
+            // SelectSubGroup cannot roll back an invalid preselection, so do
+            // not rely on sorting alone: explicitly place the highest-priority
+            // qualifying card inside the selected prefix. The activation check
+            // already requires one known qualifying card; returning null here
+            // only protects against an unexpected candidate-snapshot mismatch.
+            ClientCard ritualRelated = ordered.FirstOrDefault(IsRitualRelatedCard);
+            if (ritualRelated == null)
+                return null;
+            ordered.Remove(ritualRelated);
+            ordered.Insert(0, ritualRelated);
             int desired = Math.Min(max, Math.Max(min, 3));
             return SelectCount(ordered, cards, min, max, desired);
         }
@@ -1979,8 +2192,7 @@ namespace WindBot.Game.AI.Decks
                 // Griffoh consume another legal support card first.
                 int[] alternatives =
                 {
-                    CardId.SpellShatteringSword,
-                    CardId.LightAndDarknessRitual
+                    CardId.SpellShatteringSword
                 };
                 foreach (int id in alternatives)
                 {
@@ -1995,6 +2207,12 @@ namespace WindBot.Game.AI.Decks
                         return selected;
                     }
                 }
+
+                // Black Chaos will consume the available Mind Shuffle when it
+                // resolves later in this chain. If no different legal support
+                // card remains, do not preselect the same Deck copy for both
+                // effects.
+                return null;
             }
 
             return SelectCommonRitualSupportCard(cards, min, max);
@@ -2173,8 +2391,7 @@ namespace WindBot.Game.AI.Decks
             int[] preferredIds =
             {
                 CardId.MindShuffle,
-                CardId.SpellShatteringSword,
-                CardId.LightAndDarknessRitual
+                CardId.SpellShatteringSword
             };
 
             foreach (int id in preferredIds)
@@ -2363,9 +2580,9 @@ namespace WindBot.Game.AI.Decks
             if (legal.Count == 0)
                 return null;
 
-            // ChainTargets and the local reservation set contain targets that
-            // have already been selected or committed by an earlier effect
-            // in this chain. Do not spend another effect on the same card.
+            // Only targets committed by our own effects are reserved. Opponent
+            // effects targeting their own cards must not make those cards look
+            // unavailable to our interaction.
             List<ClientCard> unused = legal.Where(c => !IsOpponentTargetReserved(c))
                 .ToList();
             if (unused.Count < min)
@@ -2409,15 +2626,15 @@ namespace WindBot.Game.AI.Decks
 
         private bool IsOpponentTargetReserved(ClientCard card)
         {
-            return card != null && (Duel.ChainTargets.Contains(card) ||
-                Duel.LastChainTargets.Contains(card) ||
-                _reservedOpponentTargets.Contains(card));
-        }
+            if (card == null)
+                return false;
+            if (_reservedOpponentTargets.Contains(card))
+                return true;
 
-        private ClientCard GetRitualSummonTarget()
-        {
-            return Bot.Hand.Where(IsRitualMonster)
-                .OrderBy(GetRitualMonsterPriority).FirstOrDefault();
+            return Duel.CurrentChainInfo != null &&
+                Duel.CurrentChainInfo.Any(chain => chain != null &&
+                    chain.ActivatePlayer == 0 && chain.Targets != null &&
+                    chain.Targets.Contains(card));
         }
 
         private bool HasRitualMonsterSearchTarget()
@@ -2429,30 +2646,6 @@ namespace WindBot.Game.AI.Decks
                 Bot.HasInDeck(CardId.BlackChaos) ||
                 Bot.HasInDeck(CardId.CelticMystic) ||
                 Bot.HasInDeck(CardId.Griffoh);
-        }
-
-        private bool CanRitualSummon(ClientCard target)
-        {
-            if (target == null || !IsRitualMonster(target))
-                return false;
-
-            // Griffoh's Graveyard effect lets it alone satisfy the complete
-            // material requirement for a Level 8 Ritual Monster. Include that
-            // replacement in the activation check; otherwise the spell is
-            // rejected before the material callback can select Griffoh.
-            if (target.Level == 8 && Bot.Graveyard.Any(c => c != null &&
-                c.IsCode(CardId.Griffoh)))
-                return true;
-
-            List<ClientCard> materials = GetRitualMaterialPool()
-                .Where(c => c != target).ToList();
-            return materials.Sum(c => Math.Max(0, c.Level)) >= target.Level;
-        }
-
-        private List<ClientCard> GetRitualMaterialPool()
-        {
-            return Bot.Hand.Concat(Bot.GetMonsters()).Concat(Bot.Graveyard)
-                .Where(c => c != null && c.IsMonster() && c.Level > 0).ToList();
         }
 
         private List<ClientCard> GetRitualRecycleCandidates()
@@ -2903,12 +3096,16 @@ namespace WindBot.Game.AI.Decks
             if (!HasFreeSpellTrapZone())
                 return false;
 
+            if (HasPendingBlackChaosSupportSearch())
+            {
+                return Bot.HasInDeck(CardId.SpellShatteringSword) &&
+                    !IsSearchTargetUnavailable(CardId.SpellShatteringSword);
+            }
+
             return Bot.HasInDeck(CardId.MindShuffle) &&
                     !IsSearchTargetUnavailable(CardId.MindShuffle) ||
                 Bot.HasInDeck(CardId.SpellShatteringSword) &&
-                    !IsSearchTargetUnavailable(CardId.SpellShatteringSword) ||
-                Bot.HasInDeck(CardId.LightAndDarknessRitual) &&
-                    !IsSearchTargetUnavailable(CardId.LightAndDarknessRitual);
+                    !IsSearchTargetUnavailable(CardId.SpellShatteringSword);
         }
 
         private bool CanReceiveDamage()
@@ -2960,8 +3157,16 @@ namespace WindBot.Game.AI.Decks
 
         private bool CanUseSpatialTrunadeOnEnemyField()
         {
-            return Enemy.GetSpellCount() >= 2 ||
-                Enemy.GetSpells().Any(c => c.IsFaceup() && c.IsFloodgate());
+            List<ClientCard> enemyCards = Enemy.GetMonsters().Concat(Enemy.GetSpells())
+                .Where(c => c != null && !IsOpponentTargetReserved(c)).ToList();
+            if (enemyCards.Count == 0)
+                return false;
+
+            ClientCard problematic = Util.GetProblematicEnemyCard(0, false);
+            return enemyCards.Count >= 2 ||
+                problematic != null && enemyCards.Contains(problematic) ||
+                enemyCards.Any(c => c.IsExtraCard() || c.IsFacedown() ||
+                    c.IsFaceup() && c.IsFloodgate());
         }
 
         private bool IsDuplicateSpellInHand(ClientCard card)
