@@ -2202,15 +2202,19 @@ namespace WindBot.Game.AI.Decks
             List<ClientCard> candidates = available.Where(c => c != null &&
                 c.HasType(CardType.Synchro)).ToList();
             List<int> preferredIds = new List<int>();
-            if (Enemy.GetMonsterCount() >= 2)
+            int enemyMonsterCount = Enemy.GetMonsterCount();
+            if (enemyMonsterCount >= 2 &&
+                (HasDuplicateCardInHand() || !CanActivatePurulia()))
+            {
+                preferredIds.Add(CardId.EnigmasterPackbit);
+            }
+            if (enemyMonsterCount >= 2)
                 preferredIds.Add(CardId.GoldenCloudBeastMalong);
             if (_ownMonsterReleasedToGraveThisTurn)
                 preferredIds.Add(CardId.StardustDragonVictimSanctuary);
-            if (HasDuplicateCardInHand() || !CanActivatePurulia())
-                preferredIds.Add(CardId.EnigmasterPackbit);
             if (!Bot.Hand.Any(IsRitualMonster))
                 preferredIds.Add(CardId.HeraldOfTheArcLight);
-            if (Enemy.GetMonsterCount() == 1)
+            if (enemyMonsterCount == 1)
                 preferredIds.Add(CardId.WindPegasusIgnister);
 
             return preferredIds.FirstOrDefault(id =>
