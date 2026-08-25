@@ -47,6 +47,7 @@ namespace WindBot.Game.AI.Decks
             public const int RedNovaDragonBurningSoul = 65541655;
             public const int PsychicEndPunisher = 60465049;
             public const int ChaosAngel = 22850702;
+            public const int FiendsmithsRequiem = 2463794;
             public const int TheCrimsonKing = 67809530;
             public const int RedDragonArchfiend = 70902743;
             public const int EnigmasterPackbit = 72444406;
@@ -78,6 +79,18 @@ namespace WindBot.Game.AI.Decks
         // without this state the executor can keep adding Graveyard monsters
         // after Kuriboh Guardian has already fulfilled the entire requirement.
         private bool _selectingLightAndDarknessRitualMaterials;
+        // Black Chaos's Special Summon procedure is chainless. Restrict its
+        // ToDeck selector to the action which actually armed it, otherwise an
+        // unrelated chainless return-to-Deck prompt can consume this policy.
+        private bool _selectingBlackChaosSpecialSummonReturn;
+        // Spell Shattering Sword must directly follow the opponent's latest
+        // chain link. Preserve that exact field monster through its option and
+        // target prompts instead of scanning backwards through older links.
+        private ClientCard _pendingSpellShatteringSwordMonsterTarget;
+        private bool _pendingSpellShatteringSwordSpellDestroy;
+        // Fydraulis reveals first and sends one of those revealed Synchros
+        // later. Keep the intended payload name stable across both prompts.
+        private int _pendingFydraulisSynchroToGraveId;
         // Light and Darkness Ritual's Graveyard effect selects its second
         // return card while the card is still in the Graveyard. Keep that
         // selection reserved until the chain ends so Skull Archfiend cannot
@@ -93,6 +106,7 @@ namespace WindBot.Game.AI.Decks
         // support card from the stale deck view.
         private readonly HashSet<int> _pendingDeckSearchIds =
             new HashSet<int>();
+        private bool _pendingBlackChaosSupportSearch;
         // Keep a local count for Mind Shuffle copies that have entered our
         // Spell Zone. A few server/client message sequences leave the local
         // SpellZone card object temporarily stale after the card resolves;
@@ -281,10 +295,15 @@ namespace WindBot.Game.AI.Decks
             _ritualSummonCountThisTurn = 0;
             _celticMysticDrawTriggerPending = false;
             _selectingLightAndDarknessRitualMaterials = false;
+            _selectingBlackChaosSpecialSummonReturn = false;
+            _pendingSpellShatteringSwordMonsterTarget = null;
+            _pendingSpellShatteringSwordSpellDestroy = false;
+            _pendingFydraulisSynchroToGraveId = 0;
             _pendingReleaseCards.Clear();
             _pendingLightAndDarknessReturnCards.Clear();
             _reservedOpponentTargets.Clear();
             _pendingDeckSearchIds.Clear();
+            _pendingBlackChaosSupportSearch = false;
             _mindShuffleFieldCount = 0;
             _activatedFirstEffectCardIdsThisTurn.Clear();
             ResetMindShuffleSummonOrder();
@@ -370,6 +389,19 @@ namespace WindBot.Game.AI.Decks
                 _activatedFirstEffectCardIdsThisTurn.Add(card.Id);
             }
 
+            if (player == 0 && card != null && IsMultiEffectCard(card))
+            {
+                ChainInfo latest = GetLatestChainInfo();
+                if (latest != null && latest.ActivatePlayer == 0 &&
+                    latest.IsActivateCode(card.Id) && IsFirstEffect(latest))
+                {
+                    // Prefer activation-time tracking when the packet snapshot
+                    // is already available. OnChainSolved remains a fallback
+                    // for cores that publish the description later.
+                    _activatedFirstEffectCardIdsThisTurn.Add(card.Id);
+                }
+            }
+
             base.OnChaining(player, card);
         }
 
@@ -406,8 +438,12 @@ namespace WindBot.Game.AI.Decks
         {
             _celticMysticDrawTriggerPending = false;
             _selectingLightAndDarknessRitualMaterials = false;
+            _pendingSpellShatteringSwordMonsterTarget = null;
+            _pendingSpellShatteringSwordSpellDestroy = false;
+            _pendingFydraulisSynchroToGraveId = 0;
             _reservedOpponentTargets.Clear();
             _pendingDeckSearchIds.Clear();
+            _pendingBlackChaosSupportSearch = false;
             _pendingLightAndDarknessReturnCards.Clear();
             base.OnChainEnd();
         }
@@ -478,6 +514,7 @@ namespace WindBot.Game.AI.Decks
         public override void OnNewPhase()
         {
             _celticMysticDrawTriggerPending = false;
+            _selectingBlackChaosSpecialSummonReturn = false;
             base.OnNewPhase();
         }
 
@@ -494,6 +531,13 @@ namespace WindBot.Game.AI.Decks
             }
 
             _selectingLightAndDarknessRitualMaterials = false;
+
+            if (Duel.LastSummonedCards.Any(c => c != null &&
+                c.Controller == 0 && c.IsCode(CardId.CelticMystic)))
+            {
+                _celticMysticDrawTriggerPending =
+                    Bot.Hand.Any(IsRitualRelatedCard);
+            }
 
             base.OnSpSummoned();
         }
@@ -666,10 +710,12 @@ namespace WindBot.Game.AI.Decks
             // Ritual Monster from the hand or Graveyard to the Deck. This
             // request is outside a normal chain, so prefer Graveyard cards
             // before hand cards here.
-            if (chain == null && hint == HintMsg.ToDeck)
+            if (chain == null && hint == HintMsg.ToDeck &&
+                _selectingBlackChaosSpecialSummonReturn)
             {
                 IList<ClientCard> blackChaosReturn =
                     SelectBlackChaosSpecialSummonReturn(cards, min, max);
+                _selectingBlackChaosSpecialSummonReturn = false;
                 if (blackChaosReturn != null)
                     return blackChaosReturn;
             }
@@ -817,7 +863,10 @@ namespace WindBot.Game.AI.Decks
 
             selected = GetOptionIndex(options, CardId.SpellShatteringSword, 1);
             if (selected >= 0 && CanUseSpellShatteringSwordSpellDestroy())
+            {
+                _pendingSpellShatteringSwordMonsterTarget = null;
                 return selected;
+            }
             selected = GetOptionIndex(options, CardId.SpellShatteringSword, 2);
             if (selected >= 0 && CanUseSpellShatteringSwordMonsterNegate())
                 return selected;
@@ -906,13 +955,33 @@ namespace WindBot.Game.AI.Decks
                 DefaultCheckWhetherCardIsNegated(Card))
                 return false;
 
-            ClientCard chainCard = GetCurrentOpponentChainCard();
-            ClientCard problematicMonster = Util.GetProblematicEnemyMonster(0, true);
-            return chainCard != null && chainCard.Controller == 1 &&
-                chainCard.Location == CardLocation.MonsterZone &&
-                chainCard.IsMonster() && !chainCard.IsDisabled() &&
-                problematicMonster != null && problematicMonster.IsFaceup() &&
-                !IsOpponentTargetReserved(problematicMonster);
+            // Use the activation snapshot instead of the mutable live card.
+            // The opponent's monster may already have left the field as cost,
+            // while its effect was still legally activated from the field.
+            ChainInfo latest = GetLatestChainInfo();
+            if (!IsOpponentMonsterEffectChain(latest))
+                return false;
+
+            ClientCard source = GetChainSourceCard(latest);
+            if (source != null && source.IsDisabled())
+                return false;
+
+            List<ClientCard> synchros = Bot.ExtraDeck.Where(c => c != null &&
+                c.HasType(CardType.Synchro)).ToList();
+            if (synchros.Count >= 5)
+            {
+                return HasFreshOpponentTarget(
+                    GetOrderedFydraulisTargets(Enemy.GetMonsters()));
+            }
+
+            // Three revealed Synchros still unlock the send-to-Graveyard
+            // payload. Spend the card only when that payload has an immediate
+            // strategic purpose; with one or two Synchros, reserve it for an
+            // emergency body on an otherwise empty field.
+            if (synchros.Count >= 3)
+                return GetPreferredFydraulisSynchroToGraveId(synchros) != 0;
+            return synchros.Count > 0 && Bot.GetMonsterCount() == 0 &&
+                Enemy.GetMonsterCount() > 0;
         }
 
         private bool GriffohActivate()
@@ -938,9 +1007,12 @@ namespace WindBot.Game.AI.Decks
             if (HasMindShuffleOnField())
                 return false;
 
-            return !ShouldSummonCelticMysticFirst() &&
+            bool accept = !ShouldSummonCelticMysticFirst() &&
                 !ShouldDelayForHigherPriorityHandStarter(CardId.BlackChaos) &&
                 CanSearchBlackChaosSupportCard();
+            if (accept)
+                _pendingBlackChaosSupportSearch = true;
+            return accept;
         }
 
         private bool BlackSkullDragonFieldActivate()
@@ -956,7 +1028,10 @@ namespace WindBot.Game.AI.Decks
                 DefaultCheckWhetherCardIsNegated(Card))
                 return false;
 
-            return CanUseBlackSkullDragonHandSpecialSummon();
+            // Do not discard Light and Darkness Ritual for this summon while
+            // the same Ritual Spell is already a legal immediate action.
+            return !HasHigherPriorityLightAndDarknessRitualCandidate() &&
+                CanUseBlackSkullDragonHandSpecialSummon();
         }
 
         private bool BlackChaosFieldActivate()
@@ -980,10 +1055,13 @@ namespace WindBot.Game.AI.Decks
             if (HasHigherPriorityLightAndDarknessRitualCandidate())
                 return false;
 
-            return !ShouldWaitForGallantThief() &&
+            bool accept = !ShouldWaitForGallantThief() &&
                 !ShouldSummonCelticMysticFirst() &&
                 (Card.Location != CardLocation.Hand ||
                     !ShouldDelayForHigherPriorityHandStarter(CardId.BlackChaos));
+            if (accept)
+                _selectingBlackChaosSpecialSummonReturn = true;
+            return accept;
         }
 
         private bool CelticMysticSummon()
@@ -1113,7 +1191,10 @@ namespace WindBot.Game.AI.Decks
                 // Effect 2 only returns this card to the hand. It does not
                 // search the Deck, so the availability of a monster for effect
                 // 1 must not suppress this delayed Graveyard trigger.
-                return Bot.GetMonsters().All(c => c == null || c.HasType(CardType.Ritual));
+                // Facedown monsters do not expose a non-Ritual type and must
+                // not suppress this Graveyard recovery trigger.
+                return !Bot.GetMonsters().Any(c => c != null && c.IsFaceup() &&
+                    !c.HasType(CardType.Ritual));
             }
 
             return HasRitualMonsterSearchTarget() &&
@@ -1344,7 +1425,8 @@ namespace WindBot.Game.AI.Decks
             return !ShouldWaitForGallantThief() &&
                 Card.Location == CardLocation.Grave &&
                 !DefaultCheckWhetherCardIsNegated(Card) &&
-                HasFreshOpponentTarget(Enemy.GetMonsters());
+                HasFreshOpponentTarget(Enemy.GetMonsters().Where(c =>
+                    c != null && c.IsFaceup()));
         }
 
         private bool EcclesiaAndTheDarkDragonActivate()
@@ -1463,15 +1545,6 @@ namespace WindBot.Game.AI.Decks
                     (Bot.Hand.Any(handCard => handCard != null && handCard != c &&
                          IsRitualRelatedCard(handCard)) ||
                      Bot.Hand.Any(IsRitualMonster)));
-        }
-
-        private bool IsOpponentGraveyardCard(ClientCard card)
-        {
-            // "A Graveyard card targeted by the opponent" includes either
-            // player's Graveyard. The chain owner is checked by the caller;
-            // this helper only classifies the target's current location.
-            return card != null &&
-                (((int)card.Location & (int)CardLocation.Grave) != 0);
         }
 
         private bool IsHandStarterAvailable(int cardId)
@@ -1629,18 +1702,33 @@ namespace WindBot.Game.AI.Decks
             if (Duel.CurrentChain.Count == 0)
                 return false;
 
-            ChainInfo latestOpponent = GetLatestOpponentChainInfo();
-            if (latestOpponent == null)
+            ChainInfo latest = GetLatestChainInfo();
+            if (latest == null || latest.ActivatePlayer != 1)
                 return false;
 
-            bool canClearSpells = CanUseSpellShatteringSwordSpellDestroy();
-            bool canDisableMonster = CanUseSpellShatteringSwordMonsterNegate();
+            // Both branches are evaluated only against the immediately
+            // preceding opponent link. Older opponent links in the same chain
+            // are not valid reasons to activate this card now.
+            _pendingSpellShatteringSwordSpellDestroy =
+                CanUseSpellShatteringSwordSpellDestroy(latest);
+            _pendingSpellShatteringSwordMonsterTarget =
+                GetSpellShatteringSwordMonsterTarget(latest);
+            bool canClearSpells = _pendingSpellShatteringSwordSpellDestroy;
+            bool canDisableMonster =
+                _pendingSpellShatteringSwordMonsterTarget != null;
             return canClearSpells || canDisableMonster;
         }
 
         private bool CanUseSpellShatteringSwordSpellDestroy()
         {
-            ChainInfo chain = GetLatestOpponentChainInfo();
+            if (_pendingSpellShatteringSwordSpellDestroy)
+                return true;
+
+            return CanUseSpellShatteringSwordSpellDestroy(GetLatestChainInfo());
+        }
+
+        private bool CanUseSpellShatteringSwordSpellDestroy(ChainInfo chain)
+        {
             if (chain == null || chain.ActivatePlayer != 1 ||
                 !chain.HasLocation(CardLocation.SpellZone))
                 return false;
@@ -1654,13 +1742,28 @@ namespace WindBot.Game.AI.Decks
 
         private bool CanUseSpellShatteringSwordMonsterNegate()
         {
+            if (_pendingSpellShatteringSwordMonsterTarget != null &&
+                _pendingSpellShatteringSwordMonsterTarget.Controller == 1 &&
+                _pendingSpellShatteringSwordMonsterTarget.IsOnField() &&
+                _pendingSpellShatteringSwordMonsterTarget.IsFaceup())
+                return true;
+
+            _pendingSpellShatteringSwordMonsterTarget =
+                GetSpellShatteringSwordMonsterTarget(GetLatestChainInfo());
+            return _pendingSpellShatteringSwordMonsterTarget != null;
+        }
+
+        private ClientCard GetSpellShatteringSwordMonsterTarget(ChainInfo chain)
+        {
             if (!Bot.Hand.Concat(Bot.Graveyard).Any(c => c.IsCode(
                 CardId.LightAndDarknessRitual)))
-                return false;
+                return null;
 
-            ClientCard source = GetResolvingOpponentMonsterEffectSource();
-            return source != null && HasFreshOpponentTarget(
-                new ClientCard[] { source });
+            ClientCard source = GetChainSourceCard(chain);
+            if (source == null || source.IsDisabled() ||
+                !HasFreshOpponentTarget(new ClientCard[] { source }))
+                return null;
+            return source;
         }
 
         private bool SpatialTrunadeActivate()
@@ -1682,7 +1785,22 @@ namespace WindBot.Game.AI.Decks
 
         private bool ChaosSpellSet()
         {
-            return DefaultSpellSet();
+            if (!(Card.IsTrap() || Card.HasType(CardType.QuickPlay) ||
+                DefaultSpellMustSetFirst()))
+                return false;
+
+            int reservedZones = 1;
+            bool albionMaySetFallen = Bot.HasInGraveyard(
+                CardId.AlbionTheBrandedDragon) &&
+                Bot.HasInDeck(CardId.TheFallenTheVirtuous);
+            bool handEngineMaySetSupport =
+                Bot.HasInHand(CardId.Griffoh) && CanSetGriffohSupportCard() ||
+                Bot.HasInHand(CardId.BlackChaos) &&
+                    CanSearchBlackChaosSupportCard();
+            if (albionMaySetFallen || handEngineMaySetSupport)
+                reservedZones = 2;
+
+            return Bot.GetSpellCountWithoutField() < 5 - reservedZones;
         }
 
         private IList<ClientCard> SelectResolutionCard(ChainInfo chain,
@@ -1735,8 +1853,8 @@ namespace WindBot.Game.AI.Decks
                     }
                     returnCandidates = returnCandidates
                         .OrderByDescending(IsOpponentTargetedByCurrentChain)
-                        .ThenBy(GetMindShuffleReturnPriority)
                         .ThenByDescending(WasCardActivatedThisTurn)
+                        .ThenBy(GetMindShuffleReturnPriority)
                         .ToList();
                     IList<ClientCard> selected = SelectCount(returnCandidates, cards,
                         min, max, 1);
@@ -1831,7 +1949,11 @@ namespace WindBot.Game.AI.Decks
 
             if (chain.IsActivateCode(CardId.EnigmasterPackbit) &&
                 hint == HintMsg.Target)
-                return SelectEffectTarget(cards, min, max, false);
+            {
+                return SelectEffectTarget(cards.Where(c => c != null &&
+                    c.Controller == 1 && c.IsMonster() && c.IsFaceup()).ToList(),
+                    min, max, false);
+            }
 
             if (chain.IsActivateCode(CardId.EcclesiaAndTheDarkDragon) &&
                 (hint == HintMsg.Target || hint == HintMsg.ToDeck))
@@ -1844,8 +1966,22 @@ namespace WindBot.Game.AI.Decks
 
             if (chain.IsActivateCode(CardId.FydraulisHarmonia) && hint == HintMsg.Confirm)
             {
-                List<ClientCard> synchros = cards.Where(c => c.HasType(CardType.Synchro))
-                    .OrderBy(c => c.Attack).Take(Math.Min(5, max)).ToList();
+                List<ClientCard> candidates = cards.Where(c => c != null &&
+                    c.HasType(CardType.Synchro)).ToList();
+                _pendingFydraulisSynchroToGraveId =
+                    GetPreferredFydraulisSynchroToGraveId(candidates);
+
+                List<ClientCard> synchros = new List<ClientCard>();
+                if (_pendingFydraulisSynchroToGraveId != 0)
+                {
+                    ClientCard payload = candidates.FirstOrDefault(c =>
+                        c.IsCode(_pendingFydraulisSynchroToGraveId));
+                    if (payload != null)
+                        synchros.Add(payload);
+                }
+                synchros.AddRange(candidates.Where(c => !synchros.Contains(c))
+                    .OrderBy(c => c.Attack));
+                synchros = synchros.Take(Math.Min(5, max)).ToList();
                 if (synchros.Count >= min)
                     return Util.CheckSelectCount(synchros, cards, min, max);
             }
@@ -1856,13 +1992,14 @@ namespace WindBot.Game.AI.Decks
             if (chain.IsActivateCode(CardId.FydraulisHarmonia) &&
                 (hint == HintMsg.Destroy || hint == HintMsg.Target))
             {
-                ClientCard problematic = Util.GetProblematicEnemyMonster(0, false);
-                if (problematic != null && cards.Contains(problematic))
-                    return SelectNonOverlappingTarget(cards, min, max,
-                        new List<ClientCard> { problematic });
+                List<ClientCard> ordered = GetOrderedFydraulisTargets(
+                    cards.Where(c => c.Controller == 1 && c.IsMonster()));
+                IEnumerable<ClientCard> fallback = cards.Where(c => c != null &&
+                    c.Controller == 1 && c.IsMonster() && !ordered.Contains(c))
+                    .OrderByDescending(GetFydraulisTargetPriority)
+                    .ThenByDescending(c => c.GetDefensePower());
                 return SelectNonOverlappingTarget(cards, min, max,
-                    cards.Where(c => c.Controller == 1 && c.IsMonster())
-                        .OrderByDescending(c => c.GetDefensePower()));
+                    ordered.Concat(fallback));
             }
 
             if (chain.IsActivateCode(CardId.Griffoh) && hint == HintMsg.Set)
@@ -1890,7 +2027,14 @@ namespace WindBot.Game.AI.Decks
             if (chain.IsActivateCode(CardId.BlackChaos) &&
                 (hint == HintMsg.Set || hint == HintMsg.ToField ||
                     hint == HintMsg.AddToHand))
-                return SelectPreferredIds(cards, min, max, CardId.MindShuffle);
+            {
+                IList<ClientCard> selected = SelectPreferredIds(cards, min, max,
+                    CardId.MindShuffle);
+                _pendingBlackChaosSupportSearch = false;
+                if (selected != null)
+                    ReservePendingDeckSearch(selected);
+                return selected;
+            }
 
             if (chain.IsActivateCode(CardId.SkullArchfiendOfChaos))
             {
@@ -1934,8 +2078,14 @@ namespace WindBot.Game.AI.Decks
                     return SelectFallenExtraDeckCost(cards, min, max);
                 if (hint == HintMsg.Destroy || hint == HintMsg.Target)
                 {
+                    List<ClientCard> ordered = GetOrderedFallenTargets(
+                        cards.Where(c => c.Controller == 1));
+                    IEnumerable<ClientCard> fallback = cards.Where(c => c != null &&
+                        c.Controller == 1 && c.IsFaceup() && !ordered.Contains(c))
+                        .OrderByDescending(GetFallenTargetPriority)
+                        .ThenByDescending(c => Math.Max(c.Attack, c.Defense));
                     return SelectNonOverlappingTarget(cards, min, max,
-                        GetOrderedFallenTargets(cards.Where(c => c.Controller == 1)));
+                        ordered.Concat(fallback));
                 }
             }
 
@@ -1946,7 +2096,7 @@ namespace WindBot.Game.AI.Decks
                 if (hint == HintMsg.Target || hint == HintMsg.Disable)
                     return SelectSpellShatteringSwordMonsterTarget(cards, min, max);
                 if (hint == HintMsg.Destroy)
-                    return SelectEffectTarget(cards, min, max, false);
+                    return SelectEffectTarget(cards, min, max, false, false);
             }
 
             if (chain.IsActivateCode(CardId.SpatialTrunade) && hint == HintMsg.ReturnToHand)
@@ -2027,6 +2177,30 @@ namespace WindBot.Game.AI.Decks
         private IList<ClientCard> SelectFydraulisSynchroToGrave(IList<ClientCard> cards,
             int min, int max)
         {
+            int preferredId = _pendingFydraulisSynchroToGraveId;
+            if (preferredId == 0 || !cards.Any(c => c != null &&
+                c.IsCode(preferredId)))
+            {
+                preferredId = GetPreferredFydraulisSynchroToGraveId(cards);
+            }
+
+            _pendingFydraulisSynchroToGraveId = 0;
+            if (preferredId != 0)
+            {
+                IList<ClientCard> selected = SelectPreferredIds(cards, min, max,
+                    preferredId);
+                if (selected != null)
+                    return selected;
+            }
+            return SelectCount(cards.Where(c => c != null && c.HasType(CardType.Synchro))
+                .OrderBy(c => c.Attack), cards, min, max, 1);
+        }
+
+        private int GetPreferredFydraulisSynchroToGraveId(
+            IEnumerable<ClientCard> available)
+        {
+            List<ClientCard> candidates = available.Where(c => c != null &&
+                c.HasType(CardType.Synchro)).ToList();
             List<int> preferredIds = new List<int>();
             if (Enemy.GetMonsterCount() >= 2)
                 preferredIds.Add(CardId.GoldenCloudBeastMalong);
@@ -2034,34 +2208,25 @@ namespace WindBot.Game.AI.Decks
                 preferredIds.Add(CardId.StardustDragonVictimSanctuary);
             if (HasDuplicateCardInHand() || !CanActivatePurulia())
                 preferredIds.Add(CardId.EnigmasterPackbit);
-            if (!Bot.Hand.Any(c => c != null && c.HasType(CardType.Ritual)))
+            if (!Bot.Hand.Any(IsRitualMonster))
                 preferredIds.Add(CardId.HeraldOfTheArcLight);
             if (Enemy.GetMonsterCount() == 1)
                 preferredIds.Add(CardId.WindPegasusIgnister);
 
-            foreach (int id in preferredIds)
-            {
-                IList<ClientCard> selected = SelectPreferredIds(cards, min, max, id);
-                if (selected != null)
-                    return selected;
-            }
-
-            return SelectCount(cards.Where(c => c != null && c.HasType(CardType.Synchro))
-                .OrderBy(c => c.Attack), cards, min, max, 1);
+            return preferredIds.FirstOrDefault(id =>
+                candidates.Any(c => c.IsCode(id)));
         }
 
         private IList<ClientCard> SelectSkullArchfiendRecycleCards(IList<ClientCard> cards,
             int min, int max)
         {
-            ClientCard requiredReturn = GetLatestOpponentGraveyardRelevantCard();
             List<ClientCard> candidates = LimitSkullArchfiendRitualCopies(
-                cards.Where(IsSkullArchfiendRecycleCandidate), requiredReturn);
+                cards.Where(IsSkullArchfiendRecycleCandidate));
             if (candidates.Count < min)
                 return null;
 
             List<ClientCard> ordered = candidates
-                .OrderByDescending(c => c == requiredReturn)
-                .ThenBy(GetSkullArchfiendRecycleLocationPriority)
+                .OrderBy(GetSkullArchfiendRecycleLocationPriority)
                 .ThenBy(GetSkullArchfiendRecycleCardPriority)
                 .ThenByDescending(c => IsDuplicateInGrave(c, cards))
                 .ToList();
@@ -2118,35 +2283,6 @@ namespace WindBot.Game.AI.Decks
             if (card.IsCode(CardId.SkullArchfiendOfChaos))
                 return 8;
             return 9;
-        }
-
-        private ClientCard GetLatestOpponentGraveyardRelevantCard()
-        {
-            if (Duel.CurrentChainInfo == null || Duel.CurrentChainInfo.Count == 0)
-                return null;
-
-            for (int i = Duel.CurrentChainInfo.Count - 1; i >= 0; --i)
-            {
-                ChainInfo chain = Duel.CurrentChainInfo[i];
-                if (chain == null || chain.ActivatePlayer != 1)
-                    continue;
-
-                if (chain.HasLocation(CardLocation.Grave) &&
-                    chain.RelatedCard != null)
-                    return chain.RelatedCard;
-
-                if (chain.Targets != null)
-                {
-                    ClientCard target = chain.Targets.FirstOrDefault(
-                        IsOpponentGraveyardCard);
-                    if (target != null)
-                        return target;
-                }
-
-                return null;
-            }
-
-            return null;
         }
 
         private bool IsOwnGraveyardRitualMonster(ClientCard card)
@@ -2220,11 +2356,7 @@ namespace WindBot.Game.AI.Decks
 
         private bool HasPendingBlackChaosSupportSearch()
         {
-            return Duel.CurrentChainInfo != null &&
-                Duel.CurrentChainInfo.Any(chain => chain != null &&
-                    chain.ActivatePlayer == 0 &&
-                    chain.IsActivateCode(CardId.BlackChaos) &&
-                    chain.HasLocation(CardLocation.Hand));
+            return _pendingBlackChaosSupportSearch;
         }
 
         private IList<ClientCard> SelectBlackSkullDragonSupportCard(
@@ -2428,12 +2560,6 @@ namespace WindBot.Game.AI.Decks
             return Util.CheckSelectCount(ordered, cards, min, max);
         }
 
-        private IList<ClientCard> SelectDiscardCards(IList<ClientCard> cards,
-            int min, int max)
-        {
-            return Util.CheckSelectCount(GetOrderedDiscardCards(cards), cards, min, max);
-        }
-
         private List<ClientCard> GetOrderedDiscardCards(IList<ClientCard> cards)
         {
             return cards.OrderBy(c => IsDuplicateInSelection(c, cards) ? 0 : 1)
@@ -2442,16 +2568,14 @@ namespace WindBot.Game.AI.Decks
         }
 
         private IList<ClientCard> SelectEffectTarget(IList<ClientCard> cards,
-            int min, int max, bool allowOwnFallback)
+            int min, int max, bool allowOwnFallback, bool targeted = true)
         {
             ClientCard problematic = Util.GetProblematicEnemyCard(0, true);
             List<ClientCard> enemyCards = cards.Where(c => c != null &&
-                c.Controller == 1).OrderByDescending(c => c.IsExtraCard())
-                .ThenByDescending(c => c.IsFaceup())
-                .ThenByDescending(c => c.GetDefensePower()).ToList();
-
-            if (problematic != null && cards.Contains(problematic))
-                enemyCards.Insert(0, problematic);
+                    c.Controller == 1)
+                .OrderByDescending(c => GetGeneralRemovalPriority(c,
+                    problematic, targeted))
+                .ThenByDescending(c => Math.Max(c.Attack, c.Defense)).ToList();
             if (enemyCards.Count > 0)
             {
                 IList<ClientCard> enemySelection =
@@ -2465,6 +2589,46 @@ namespace WindBot.Game.AI.Decks
 
             return SelectCount(cards.Where(c => c != null && c.Controller == 0)
                 .OrderBy(c => c.GetDefensePower()), cards, min, max, 1);
+        }
+
+        private int GetGeneralRemovalPriority(ClientCard card,
+            ClientCard problematic, bool targeted)
+        {
+            if (card == null || card.Controller != 1)
+                return -1;
+
+            int priority = card == problematic ? 1200 : 0;
+            if (card.IsMonster())
+            {
+                if (card.IsFloodgate())
+                    priority = Math.Max(priority, 1100);
+                else if (card.IsMonsterDangerous())
+                    priority = Math.Max(priority, 1050);
+                else if (card.IsMonsterShouldBeDisabledBeforeItUseEffect())
+                    priority = Math.Max(priority, 1000);
+                else if (IsValuableFallenExtraDeckMonster(card))
+                    priority = Math.Max(priority, 850);
+                else if (card.IsFaceup())
+                    priority = Math.Max(priority, 500);
+
+                if (card.IsDisabled())
+                    priority -= 300;
+                if (targeted && CanLikelyEscapeFallenTarget(card))
+                    priority -= 450;
+                return priority;
+            }
+
+            if (card.IsFloodgate())
+                priority = Math.Max(priority, 1100);
+            else if (card.IsFacedown())
+                priority = Math.Max(priority, 800);
+            else if (card.HasType(CardType.Field))
+                priority = Math.Max(priority, 750);
+            else if (card.HasType(CardType.Continuous))
+                priority = Math.Max(priority, 700);
+            else
+                priority = Math.Max(priority, 400);
+            return priority;
         }
 
         private IList<ClientCard> SelectEcclesiaAndTheDarkDragonTarget(
@@ -2659,18 +2823,9 @@ namespace WindBot.Game.AI.Decks
         private List<ClientCard> LimitSkullArchfiendRitualCopies(
             IEnumerable<ClientCard> source)
         {
-            return LimitSkullArchfiendRitualCopies(source, null);
-        }
-
-        private List<ClientCard> LimitSkullArchfiendRitualCopies(
-            IEnumerable<ClientCard> source, ClientCard preferred)
-        {
             List<ClientCard> candidates = source.Where(c => c != null).ToList();
-            ClientCard ritual = candidates.FirstOrDefault(c => c == preferred &&
-                c.IsCode(CardId.LightAndDarknessRitual));
-            if (ritual == null)
-                ritual = candidates.FirstOrDefault(c => c.IsCode(
-                    CardId.LightAndDarknessRitual));
+            ClientCard ritual = candidates.FirstOrDefault(c => c.IsCode(
+                CardId.LightAndDarknessRitual));
 
             if (ritual == null)
                 return candidates;
@@ -2860,8 +3015,8 @@ namespace WindBot.Game.AI.Decks
 
             ClientCard selected = candidates
                 .OrderByDescending(IsOpponentTargetedByCurrentChain)
-                .ThenBy(GetMindShuffleReturnPriority)
                 .ThenByDescending(WasCardActivatedThisTurn)
+                .ThenBy(GetMindShuffleReturnPriority)
                 .FirstOrDefault();
 
             // If the Magician is the only normal return target, do not keep
@@ -3002,13 +3157,10 @@ namespace WindBot.Game.AI.Decks
 
         private bool CanActivatePurulia()
         {
-            return Bot.HasInHand(CardId.MulcharmyPurulia) && Bot.GetFieldCount() == 0;
-        }
-
-        private bool CanSearchMindShuffle()
-        {
-            return Bot.HasInDeck(CardId.MindShuffle) &&
-                !IsSearchTargetUnavailable(CardId.MindShuffle);
+            return Bot.HasInHand(CardId.MulcharmyPurulia) &&
+                Bot.GetFieldCount() == 0 &&
+                !_activatedFirstEffectCardIdsThisTurn.Contains(
+                    CardId.MulcharmyPurulia);
         }
 
         private bool CanSearchBlackChaosSupportCard()
@@ -3102,10 +3254,14 @@ namespace WindBot.Game.AI.Decks
                     !IsSearchTargetUnavailable(CardId.SpellShatteringSword);
             }
 
-            return Bot.HasInDeck(CardId.MindShuffle) &&
-                    !IsSearchTargetUnavailable(CardId.MindShuffle) ||
-                Bot.HasInDeck(CardId.SpellShatteringSword) &&
-                    !IsSearchTargetUnavailable(CardId.SpellShatteringSword);
+            // Griffoh sets directly from the Deck. A copy already in hand
+            // cannot be activated this turn, so it must not block setting a
+            // second copy from the Deck.
+            return (Bot.HasInDeck(CardId.MindShuffle) &&
+                        !HasMindShuffleOnField() &&
+                        !_pendingDeckSearchIds.Contains(CardId.MindShuffle)) ||
+                (Bot.HasInDeck(CardId.SpellShatteringSword) &&
+                    !IsSearchTargetUnavailable(CardId.SpellShatteringSword));
         }
 
         private bool CanReceiveDamage()
@@ -3134,6 +3290,7 @@ namespace WindBot.Game.AI.Decks
                 return false;
 
             return card.Description.IndexOf("傷害", StringComparison.Ordinal) >= 0 ||
+                card.Description.IndexOf("伤害", StringComparison.Ordinal) >= 0 ||
                 card.Description.IndexOf("damage", StringComparison.OrdinalIgnoreCase) >= 0;
         }
 
@@ -3213,13 +3370,79 @@ namespace WindBot.Game.AI.Decks
         private List<ClientCard> GetOrderedFallenTargets(IEnumerable<ClientCard> source)
         {
             return source.Where(IsWorthwhileFallenTarget).Distinct()
-                .OrderByDescending(c => c.IsMonster() && c.IsExtraCard())
-                .ThenByDescending(c => c.IsMonster() &&
-                    (c.IsFloodgate() || c.IsMonsterDangerous() ||
-                        c.IsMonsterShouldBeDisabledBeforeItUseEffect()))
-                .ThenByDescending(c => c.HasType(CardType.Field | CardType.Continuous))
+                .OrderByDescending(GetFallenTargetPriority)
                 .ThenByDescending(c => Math.Max(c.Attack, c.Defense))
                 .ToList();
+        }
+
+        private int GetFallenTargetPriority(ClientCard card)
+        {
+            if (card == null || card.Controller != 1 || !card.IsFaceup())
+                return -1;
+
+            if (!card.IsMonster())
+            {
+                if (card.IsFloodgate())
+                    return 1000;
+                if (card.HasType(CardType.Field))
+                    return 850;
+                if (card.HasType(CardType.Continuous))
+                    return 800;
+                return 0;
+            }
+
+            int priority = GetDestructionMonsterPriority(card);
+            // The Fallen targets when it is activated. A monster that can
+            // publicly remove itself in response is less reliable, but remains
+            // a fallback because the opponent's hidden resources are unknown.
+            if (CanLikelyEscapeFallenTarget(card))
+                priority -= 450;
+            return priority;
+        }
+
+        private List<ClientCard> GetOrderedFydraulisTargets(IEnumerable<ClientCard> source)
+        {
+            return source.Where(IsWorthwhileDestructionMonster).Distinct()
+                .OrderByDescending(GetFydraulisTargetPriority)
+                .ThenByDescending(c => Math.Max(c.Attack, c.Defense))
+                .ToList();
+        }
+
+        private int GetFydraulisTargetPriority(ClientCard card)
+        {
+            if (card == null || card.Controller != 1 || !card.IsMonster())
+                return -1;
+
+            // Fydraulis chooses the monster while its non-targeting effect is
+            // resolving, so target-dodging effects do not receive The Fallen's
+            // priority penalty here.
+            return GetDestructionMonsterPriority(card);
+        }
+
+        private int GetDestructionMonsterPriority(ClientCard card)
+        {
+            if (card == null || !card.IsMonster())
+                return -1;
+
+            int priority;
+            if (card.IsFloodgate())
+                priority = 1000;
+            else if (card.IsMonsterDangerous())
+                priority = 950;
+            else if (card.IsMonsterShouldBeDisabledBeforeItUseEffect())
+                priority = 900;
+            else if (IsValuableFallenExtraDeckMonster(card))
+                priority = 750;
+            else if (MeetsFallenMonsterStatThreshold(card))
+                priority = 500;
+            else
+                priority = 0;
+
+            // A disabled monster can still be material or a battle threat, so
+            // demote it instead of excluding it outright.
+            if (card.IsDisabled())
+                priority -= 350;
+            return priority;
         }
 
         private bool IsWorthwhileFallenTarget(ClientCard card)
@@ -3230,14 +3453,37 @@ namespace WindBot.Game.AI.Decks
             }
 
             if (card.IsMonster())
-            {
-                return card.IsExtraCard() || card.IsFloodgate() || card.IsMonsterDangerous() ||
-                        card.IsMonsterShouldBeDisabledBeforeItUseEffect() ||
-                        (card.Attack + card.Defense >= 2700 &&
-                            (card.Attack >= 1800 || card.Defense >= 2100));
-            }
+                return IsWorthwhileDestructionMonster(card);
 
             return card.HasType(CardType.Field | CardType.Continuous);
+        }
+
+        private bool IsWorthwhileDestructionMonster(ClientCard card)
+        {
+            return card != null && card.Controller == 1 && card.IsMonster() &&
+                card.IsFaceup() &&
+                (IsValuableFallenExtraDeckMonster(card) || card.IsFloodgate() ||
+                    card.IsMonsterDangerous() ||
+                    card.IsMonsterShouldBeDisabledBeforeItUseEffect() ||
+                    MeetsFallenMonsterStatThreshold(card));
+        }
+
+        private bool MeetsFallenMonsterStatThreshold(ClientCard card)
+        {
+            return card != null && card.Attack + card.Defense >= 2700 &&
+                (card.Attack >= 1800 || card.Defense >= 2100);
+        }
+
+        private bool CanLikelyEscapeFallenTarget(ClientCard card)
+        {
+            return card != null && card.IsCode(CardId.FiendsmithsRequiem) &&
+                !card.IsDisabled();
+        }
+
+        private bool IsValuableFallenExtraDeckMonster(ClientCard card)
+        {
+            return card != null && card.IsMonster() && card.IsExtraCard() &&
+                (!card.HasType(CardType.Link) || card.LinkCount >= 2);
         }
 
         private bool IsRitualMonster(ClientCard card)
@@ -3264,16 +3510,6 @@ namespace WindBot.Game.AI.Decks
                 CardId.Griffoh,
                 CardId.BlackSkullDragonTheArchfiendDragonOfUnity,
                 CardId.BlackChaos);
-        }
-
-        private bool IsLightAndDarknessRecycleCard(ClientCard card)
-        {
-            return IsRitualRelatedCard(card) || (card != null && card.IsCode(
-                CardId.BlackSkullDragonTheArchfiendDragonOfUnity,
-                CardId.CelticMystic, CardId.SkullArchfiendOfChaos,
-                CardId.MagicianOfDarkChaosBlackChaos,
-                CardId.BlackLusterSoldierSoldierOfLightAndDarkness,
-                CardId.BlackChaos, CardId.Griffoh));
         }
 
         private int GetRitualMonsterPriority(ClientCard card)
@@ -3541,7 +3777,13 @@ namespace WindBot.Game.AI.Decks
                 CardId.FydraulisHarmonia))
                 return true;
 
-            return chain.ActivateDescription == Util.GetStringId(chain.ActivateId, 0);
+            // Gallant Thief's offset 0 belongs to its Summon procedure. Its
+            // first activatable monster effect is offset 1; all other tracked
+            // multi-effect cards use offset 0 for their first effect.
+            int offset = chain.IsActivateCode(
+                CardId.TheWorldsGreatestGallantThief) ? 1 : 0;
+            return chain.ActivateDescription ==
+                Util.GetStringId(chain.ActivateId, offset);
         }
 
         private bool IsDuplicateInSelection(ClientCard card, IList<ClientCard> cards)
@@ -3613,25 +3855,6 @@ namespace WindBot.Game.AI.Decks
             return null;
         }
 
-        private ClientCard GetResolvingOpponentMonsterEffectSource()
-        {
-            if (Duel.CurrentChainInfo == null)
-                return null;
-
-            int end = Duel.CurrentChainInfo.Count;
-            if (Duel.SolvingChainIndex > 0)
-                end = Math.Min(end, Duel.SolvingChainIndex - 1);
-
-            for (int i = end - 1; i >= 0; --i)
-            {
-                ClientCard source = GetChainSourceCard(Duel.CurrentChainInfo[i]);
-                if (source != null)
-                    return source;
-            }
-
-            return null;
-        }
-
         private ClientCard FindMatchingCard(IList<ClientCard> cards,
             ClientCard source)
         {
@@ -3651,12 +3874,13 @@ namespace WindBot.Game.AI.Decks
         private IList<ClientCard> SelectSpellShatteringSwordMonsterTarget(
             IList<ClientCard> cards, int min, int max)
         {
-            ClientCard source = GetResolvingOpponentMonsterEffectSource();
-            ClientCard target = FindMatchingCard(cards, source);
+            ClientCard target = FindMatchingCard(cards,
+                _pendingSpellShatteringSwordMonsterTarget);
             if (target == null || target.Controller != 1 || !target.IsOnField() ||
                 !target.IsMonster() || !target.IsFaceup())
                 return null;
 
+            _pendingSpellShatteringSwordMonsterTarget = null;
             return SelectCount(new List<ClientCard> { target }, cards, min, max, 1);
         }
 
