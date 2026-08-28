@@ -74,6 +74,11 @@ namespace WindBot.Game.AI.Decks
         // later ignition effect so the two effects cannot borrow each other's
         // strategic conditions.
         private bool _celticMysticDrawTriggerPending;
+        // When Celtic Mystic is Special Summoned while another chain is
+        // resolving, its summon-success trigger is offered only after that
+        // chain ends. Preserve the pending flag across exactly that one chain
+        // end; later stale windows may still clear it normally.
+        private bool _preserveCelticMysticDrawTriggerAtChainEnd;
         // SelectUnselect asks for one material at a time. Once the current
         // selection is finishable, returning an empty selection confirms it;
         // without this state the executor can keep adding Graveyard monsters
@@ -294,6 +299,7 @@ namespace WindBot.Game.AI.Decks
             _enemyMaxxCResolved = false;
             _ritualSummonCountThisTurn = 0;
             _celticMysticDrawTriggerPending = false;
+            _preserveCelticMysticDrawTriggerAtChainEnd = false;
             _selectingLightAndDarknessRitualMaterials = false;
             _selectingBlackChaosSpecialSummonReturn = false;
             _pendingSpellShatteringSwordMonsterTarget = null;
@@ -380,6 +386,7 @@ namespace WindBot.Game.AI.Decks
                 // -1, then release the pending trigger context.
                 _activatedFirstEffectCardIdsThisTurn.Add(card.Id);
                 _celticMysticDrawTriggerPending = false;
+                _preserveCelticMysticDrawTriggerAtChainEnd = false;
             }
 
             if (player == 0 && card != null && card.Id != 0 &&
@@ -387,19 +394,6 @@ namespace WindBot.Game.AI.Decks
             {
                 // Single-effect cards can be recorded at activation time.
                 _activatedFirstEffectCardIdsThisTurn.Add(card.Id);
-            }
-
-            if (player == 0 && card != null && IsMultiEffectCard(card))
-            {
-                ChainInfo latest = GetLatestChainInfo();
-                if (latest != null && latest.ActivatePlayer == 0 &&
-                    latest.IsActivateCode(card.Id) && IsFirstEffect(latest))
-                {
-                    // Prefer activation-time tracking when the packet snapshot
-                    // is already available. OnChainSolved remains a fallback
-                    // for cores that publish the description later.
-                    _activatedFirstEffectCardIdsThisTurn.Add(card.Id);
-                }
             }
 
             base.OnChaining(player, card);
@@ -436,7 +430,10 @@ namespace WindBot.Game.AI.Decks
 
         public override void OnChainEnd()
         {
-            _celticMysticDrawTriggerPending = false;
+            if (_preserveCelticMysticDrawTriggerAtChainEnd)
+                _preserveCelticMysticDrawTriggerAtChainEnd = false;
+            else
+                _celticMysticDrawTriggerPending = false;
             _selectingLightAndDarknessRitualMaterials = false;
             _pendingSpellShatteringSwordMonsterTarget = null;
             _pendingSpellShatteringSwordSpellDestroy = false;
@@ -495,6 +492,7 @@ namespace WindBot.Game.AI.Decks
                 (currentLocation & (int)CardLocation.MonsterZone) == 0)
             {
                 _celticMysticDrawTriggerPending = false;
+                _preserveCelticMysticDrawTriggerAtChainEnd = false;
             }
 
             base.OnMove(card, previousControler, previousLocation, currentControler,
@@ -508,12 +506,14 @@ namespace WindBot.Game.AI.Decks
             _celticMysticDrawTriggerPending = celticMystic != null &&
                 Bot.Hand.Any(c => c != null && c != celticMystic &&
                     IsRitualRelatedCard(c));
+            _preserveCelticMysticDrawTriggerAtChainEnd = false;
             base.OnSummoning();
         }
 
         public override void OnNewPhase()
         {
             _celticMysticDrawTriggerPending = false;
+            _preserveCelticMysticDrawTriggerAtChainEnd = false;
             _selectingBlackChaosSpecialSummonReturn = false;
             base.OnNewPhase();
         }
@@ -537,6 +537,9 @@ namespace WindBot.Game.AI.Decks
             {
                 _celticMysticDrawTriggerPending =
                     Bot.Hand.Any(IsRitualRelatedCard);
+                _preserveCelticMysticDrawTriggerAtChainEnd =
+                    _celticMysticDrawTriggerPending &&
+                    Duel.CurrentChain.Count > 0;
             }
 
             base.OnSpSummoned();
@@ -1695,7 +1698,8 @@ namespace WindBot.Game.AI.Decks
             // chain has already ended by the time the server asks for it, so
             // it must not be rejected by the current-chain guard used by the
             // hand/field effects.
-            if (Card.Location == CardLocation.Grave)
+            if (Card.Location == CardLocation.Grave ||
+                Card.Location == CardLocation.Removed)
                 return IsDescription(CardId.SpellShatteringSword, 3) ||
                     ActivateDescription == -1;
 
