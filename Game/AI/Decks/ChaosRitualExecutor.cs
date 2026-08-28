@@ -96,6 +96,11 @@ namespace WindBot.Game.AI.Decks
         // Fydraulis reveals first and sends one of those revealed Synchros
         // later. Keep the intended payload name stable across both prompts.
         private int _pendingFydraulisSynchroToGraveId;
+        // Fydraulis chooses the monster only while its non-targeting effect is
+        // resolving. Reserve its best current target strategically when the
+        // activation is accepted, so a later copy of The Fallen in the same
+        // chain does not destroy the only useful monster first.
+        private ClientCard _pendingFydraulisDestructionTarget;
         // Light and Darkness Ritual's Graveyard effect selects its second
         // return card while the card is still in the Graveyard. Keep that
         // selection reserved until the chain ends so Skull Archfiend cannot
@@ -305,6 +310,7 @@ namespace WindBot.Game.AI.Decks
             _pendingSpellShatteringSwordMonsterTarget = null;
             _pendingSpellShatteringSwordSpellDestroy = false;
             _pendingFydraulisSynchroToGraveId = 0;
+            _pendingFydraulisDestructionTarget = null;
             _pendingReleaseCards.Clear();
             _pendingLightAndDarknessReturnCards.Clear();
             _reservedOpponentTargets.Clear();
@@ -438,6 +444,7 @@ namespace WindBot.Game.AI.Decks
             _pendingSpellShatteringSwordMonsterTarget = null;
             _pendingSpellShatteringSwordSpellDestroy = false;
             _pendingFydraulisSynchroToGraveId = 0;
+            _pendingFydraulisDestructionTarget = null;
             _reservedOpponentTargets.Clear();
             _pendingDeckSearchIds.Clear();
             _pendingBlackChaosSupportSearch = false;
@@ -973,8 +980,21 @@ namespace WindBot.Game.AI.Decks
                 c.HasType(CardType.Synchro)).ToList();
             if (synchros.Count >= 5)
             {
-                return HasFreshOpponentTarget(
-                    GetOrderedFydraulisTargets(Enemy.GetMonsters()));
+                // Executor conditions may be queried more than once for the
+                // same response. Reuse the first accepted reservation instead
+                // of moving it to the next monster on every query.
+                if (_pendingFydraulisDestructionTarget != null &&
+                    Enemy.GetMonsters().Contains(_pendingFydraulisDestructionTarget))
+                    return true;
+
+                ClientCard target = GetOrderedFydraulisTargets(Enemy.GetMonsters())
+                    .FirstOrDefault(c => !IsOpponentTargetReserved(c));
+                if (target == null)
+                    return false;
+
+                _pendingFydraulisDestructionTarget = target;
+                _reservedOpponentTargets.Add(target);
+                return true;
             }
 
             // Three revealed Synchros still unlock the send-to-Graveyard
@@ -2002,8 +2022,21 @@ namespace WindBot.Game.AI.Decks
                     c.Controller == 1 && c.IsMonster() && !ordered.Contains(c))
                     .OrderByDescending(GetFydraulisTargetPriority)
                     .ThenByDescending(c => c.GetDefensePower());
-                return SelectNonOverlappingTarget(cards, min, max,
-                    ordered.Concat(fallback));
+
+                // Our own strategic reservation remains selectable here.
+                // Reservations made by The Fallen or another interaction are
+                // still excluded. If the original monster left the field,
+                // fall back to the best currently legal unreserved monster.
+                List<ClientCard> candidates = new List<ClientCard>();
+                if (_pendingFydraulisDestructionTarget != null &&
+                    cards.Contains(_pendingFydraulisDestructionTarget))
+                {
+                    candidates.Add(_pendingFydraulisDestructionTarget);
+                }
+                candidates.AddRange(ordered.Concat(fallback).Where(c =>
+                    c != _pendingFydraulisDestructionTarget &&
+                    !IsOpponentTargetReserved(c)));
+                return SelectCount(candidates, cards, min, max, 1);
             }
 
             if (chain.IsActivateCode(CardId.Griffoh) && hint == HintMsg.Set)
