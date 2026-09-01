@@ -2187,7 +2187,7 @@ namespace WindBot.Game.AI.Decks
                 return false;
             }
 
-            return CanActivateAscendanceInCurrentTurn() && CanActivateAscendanceNow() &&
+            return CanActivateAscendanceForMandateChain() &&
                 AcceptRadiantQuickPlayActivation();
         }
 
@@ -2466,6 +2466,33 @@ namespace WindBot.Game.AI.Decks
             }
 
             return true;
+        }
+
+        private bool CanActivateAscendanceForMandateChain()
+        {
+            if (!Card.IsCode(CardId.RadiantTyphoonAscendance))
+            {
+                return true;
+            }
+
+            if (!CanActivateAscendanceInCurrentTurn())
+            {
+                return false;
+            }
+
+            // On the opponent's turn this is an immediate interaction line:
+            // Ascendance enters the chain so MST can destroy it and enable
+            // Mandate's negation. Do not apply Ascendance's normal late-engine
+            // ordering against other Radiant Quick-Plays or direct hand Special
+            // Summons here. The server has already offered the activation, and
+            // CanActivateAscendanceInCurrentTurn still enforces the opponent-turn
+            // revive-only resource, zone, usage and same-chain restrictions.
+            if (Duel.Player == 1)
+            {
+                return true;
+            }
+
+            return CanActivateAscendanceNow();
         }
 
         private bool CanActivateAscendanceInCurrentTurn()
